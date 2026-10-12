@@ -1,0 +1,398 @@
+From 5ef6546dedc8c3b34a6d3dee6c2e95cf81010ee3 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 12 Oct 2026 21:42:47 +0000
+Subject: [PATCH] feat(ghidra): admit m68k for headerless raw-binary loads
+
+Map m68k to Ghidra 68000:BE:32:default, require 2-byte entry alignment,
+bound the mapping to a 32-bit address width, and keep Hopper declining it.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0192KZ8mX83JSgXEpwagjMis
+---
+ docs/raw-binary.md                          | 11 ++++--
+ src/domain/binaryTarget.ts                  |  5 ++-
+ src/domain/binaryTargetTypes.ts             | 17 +++++++--
+ src/domain/native/nativeLoadImage.ts        |  2 +-
+ src/domain/rawBinary.test.ts                | 39 +++++++++++++++++++++
+ src/domain/rawBinary.ts                     | 14 +++++---
+ src/ghidra/GhidraProvider.ts                |  3 +-
+ src/ghidra/GhidraProviderClient.ts          |  2 +-
+ src/ghidra/GhidraRawBinaryLanguage.ts       | 15 ++++----
+ src/ghidra/GhidraRawBinaryLoadImage.test.ts |  4 +++
+ src/hopper/HopperAnalysisProfile.ts         |  6 ++--
+ src/hopper/HopperMachOImage.ts              |  6 +++-
+ 12 files changed, 102 insertions(+), 22 deletions(-)
+
+diff --git a/docs/raw-binary.md b/docs/raw-binary.md
+index 43fcd54..91dd878 100644
+--- a/docs/raw-binary.md
++++ b/docs/raw-binary.md
+@@ -25,10 +25,10 @@ rea inspect-native-load-image /absolute/path/to/ecu.bin --target-format raw-bina
+ }
+ ```
+ 
+-`architecture` is one of `x86`, `x86_64`, `arm`, or `arm64`. `entry_point` is a
++`architecture` is one of `x86`, `x86_64`, `arm`, `arm64`, or `m68k`. `entry_point` is a
+ hexadecimal address of the form `0x…`. The complete file is mapped starting at
+ that address, and Ghidra seeds an `entry` function there before auto-analysis.
+-ARM and AArch64 entries must be 4-byte aligned; x86 entries may be byte-aligned.
++ARM and AArch64 entries must be 4-byte aligned; m68k entries must be 2-byte aligned; x86 entries may be byte-aligned.
+ `open_binary` and an open `binary_session` return the canonical `entry_point`
+ for raw targets so callers can verify the selected mapping directly.
+ Omitted `format` keeps header-based detection; architecture and entry without
+@@ -48,6 +48,11 @@ Compiler specifications select analysis conventions; they do not identify the
+ original compiler or ABI of a headerless target. Ghidra's x86 languages do not
+ provide a compiler specification named `default`.
+ 
++`m68k` is the big-endian Motorola 68000 language with a 32-bit address width.
++A ROM that starts with a vector table (initial SP, reset PC) is not code at
++file offset 0: REA seeds an `entry` function at the mapped start, so map the
++image at its code start or review the first function as table data.
++
+ Those settings, the caller-supplied entry, and `language_selection:
+ caller-supplied-v1` are committed in the analysis profile. A different entry
+ or architecture is a different profile; snapshots from header-detected targets
+@@ -67,7 +72,7 @@ PE applications only.
+ 
+ - Headers are not discovered from file bytes. This increment does not guess
+   load addresses, vector tables, or memory maps.
+-- Big-endian, Thumb-only, Cortex-M, and other Ghidra processor variants are
++- Other big-endian variants (m68k is the only big-endian family), Thumb-only, Cortex-M, and other Ghidra processor variants are
+   unsupported.
+ - Reset vectors, memory-mapped I/O, and firmware boot sequences are not
+   emulated.
+diff --git a/src/domain/binaryTarget.ts b/src/domain/binaryTarget.ts
+index eca1174..d0df587 100644
+--- a/src/domain/binaryTarget.ts
++++ b/src/domain/binaryTarget.ts
+@@ -1,5 +1,6 @@
+ import type {
+   BinaryArchitecture,
++  RawOnlyArchitecture,
+   ElfFamilyMetadata,
+   HeaderArchitecture,
+   MipsElfMetadata,
+@@ -352,7 +353,9 @@ const machArchitecture = (cpu: number): HeaderArchitecture | undefined => {
+   return undefined;
+ };
+ 
+-const elfArchitecture = (machine: number): BinaryArchitecture | undefined => {
++const elfArchitecture = (
++  machine: number,
++): Exclude<BinaryArchitecture, RawOnlyArchitecture> | undefined => {
+   switch (machine) {
+     case 3:
+       return "x86";
+diff --git a/src/domain/binaryTargetTypes.ts b/src/domain/binaryTargetTypes.ts
+index b4d44c1..0c79abf 100644
+--- a/src/domain/binaryTargetTypes.ts
++++ b/src/domain/binaryTargetTypes.ts
+@@ -6,6 +6,7 @@ export const BINARY_ARCHITECTURES = [
+   "arm64",
+   "mips",
+   "riscv",
++  "m68k",
+ ] as const;
+ export type BinaryArchitecture = (typeof BINARY_ARCHITECTURES)[number];
+ 
+@@ -35,12 +36,21 @@ export const isElfMetadataArchitecture = (
+ ): architecture is ElfMetadataArchitecture =>
+   (ELF_METADATA_ARCHITECTURES as readonly string[]).includes(architecture);
+ 
++/** Families admitted only for a caller-described headerless raw binary. */
++export const RAW_ONLY_ARCHITECTURES = [
++  "m68k",
++] as const satisfies readonly BinaryArchitecture[];
++export type RawOnlyArchitecture = (typeof RAW_ONLY_ARCHITECTURES)[number];
++
+ /** Recognized family with no ELF metadata member; the header alone is the fact. */
+ export type HeaderArchitecture = Exclude<
+   BinaryArchitecture,
+-  ElfMetadataArchitecture
++  ElfMetadataArchitecture | RawOnlyArchitecture
+ >;
+ 
++/** Families a caller may select for a headerless raw-binary load. */
++export type RawBinaryArchitecture = HeaderArchitecture | RawOnlyArchitecture;
++
+ /** Raw ELF facts; family recognition does not establish ISA or ABI support. */
+ export interface MipsElfMetadata extends ElfFamilyMetadata {
+   /** Undefined until inspected; null means no ABI record was observed. */
+@@ -142,8 +152,11 @@ export type BinaryTarget =
+       readonly executableRole?: never;
+       readonly managed?: never;
+     })
+-  | (ExecutableTarget & {
++  | (BinaryTargetIdentity & {
++      readonly kind: "executable";
+       readonly format: "raw-binary";
++      readonly architecture: RawBinaryArchitecture;
++      readonly availableArchitectures: readonly RawBinaryArchitecture[];
+       readonly entryPoint: string;
+       readonly entryPointSource: string;
+       readonly executableRole?: never;
+diff --git a/src/domain/native/nativeLoadImage.ts b/src/domain/native/nativeLoadImage.ts
+index 6a3be44..b358f03 100644
+--- a/src/domain/native/nativeLoadImage.ts
++++ b/src/domain/native/nativeLoadImage.ts
+@@ -112,7 +112,7 @@ export const nativeLoadImageSchema = z.union([
+     status: z.enum(["verified", "mismatch"]),
+     format: z.literal("raw-binary"),
+     target_sha256: digest,
+-    architecture: z.enum(["x86", "x86_64", "arm", "arm64"]),
++    architecture: z.enum(["x86", "x86_64", "arm", "arm64", "m68k"]),
+     language_id: z.string().min(1),
+     compiler_spec_id: z.string().min(1),
+     base_address: address,
+diff --git a/src/domain/rawBinary.test.ts b/src/domain/rawBinary.test.ts
+index f22e5fc..8148b7b 100644
+--- a/src/domain/rawBinary.test.ts
++++ b/src/domain/rawBinary.test.ts
+@@ -106,6 +106,45 @@ describe("raw-binary admission", () => {
+       }
+     },
+   );
++  it("admits 2-byte aligned m68k entries and rejects odd ones", () => {
++    expect(
++      admitRawBinary({
++        architecture: "m68k",
++        entryPoint: "0x400",
++        fileBytes: 0x1000,
++      }),
++    ).toEqual({
++      ok: true,
++      value: {
++        architecture: "m68k",
++        entryPoint: "0x400",
++        entryPointSource: "0x400",
++      },
++    });
++    expect(
++      admitRawBinary({
++        architecture: "m68k",
++        entryPoint: "0x401",
++        fileBytes: 4,
++      }),
++    ).toEqual({
++      ok: false,
++      error: {
++        reason: "raw-binary m68k entry_point 0x401 must be 2-byte aligned",
++        constraint: "load_selection_rejected",
++      },
++    });
++  });
++  it("bounds an m68k mapping to the 32-bit address width", () => {
++    const result = admitRawBinary({
++      architecture: "m68k",
++      entryPoint: "0xfffffffc",
++      fileBytes: 8,
++    });
++    expect(result.ok).toBe(false);
++    if (result.ok) throw new Error("expected overflow rejection");
++    expect(result.error.reason).toContain("m68k address width");
++  });
+   it.each([
+     ["malformed entry", { architecture: "arm", entryPoint: "0xgg" }],
+     ["missing entry", { architecture: "arm", entryPoint: undefined }],
+diff --git a/src/domain/rawBinary.ts b/src/domain/rawBinary.ts
+index 94fdf6c..3c6a02c 100644
+--- a/src/domain/rawBinary.ts
++++ b/src/domain/rawBinary.ts
+@@ -2,7 +2,7 @@ import { z } from "zod";
+ 
+ import type {
+   BinaryArchitecture,
+-  HeaderArchitecture,
++  RawBinaryArchitecture,
+ } from "./binaryTargetTypes.js";
+ import type { ExecutableFormatHint } from "./dosCom.js";
+ import { err, ok, type Result } from "./result.js";
+@@ -13,6 +13,7 @@ export const BINARY_ARCHITECTURES = [
+   "x86_64",
+   "arm",
+   "arm64",
++  "m68k",
+ ] as const satisfies readonly BinaryArchitecture[];
+ 
+ /** Provider-neutral CPU family for a caller-supplied raw-binary load. */
+@@ -58,7 +59,7 @@ export const validateRawBinaryLength = (
+ 
+ /** Admitted headerless load identity used by target resolution and profiles. */
+ export interface RawBinaryAdmission {
+-  readonly architecture: HeaderArchitecture;
++  readonly architecture: RawBinaryArchitecture;
+   readonly entryPoint: string;
+   readonly entryPointSource: string;
+ }
+@@ -74,7 +75,7 @@ export interface RawBinaryAdmissionRejection {
+ }
+ 
+ const addressWidth = (architecture: BinaryArchitecture): bigint =>
+-  architecture === "x86" || architecture === "arm"
++  architecture === "x86" || architecture === "arm" || architecture === "m68k"
+     ? 0xffffffffn
+     : 0xffffffffffffffffn;
+ 
+@@ -88,7 +89,7 @@ export const admitRawBinary = (input: {
+   if (!architecture.success)
+     return err({
+       reason:
+-        "raw-binary format requires architecture (x86, x86_64, arm, or arm64)",
++        "raw-binary format requires architecture (x86, x86_64, arm, arm64, or m68k)",
+       constraint: "load_selection_rejected",
+     });
+   if (typeof input.entryPoint !== "string")
+@@ -111,6 +112,11 @@ export const admitRawBinary = (input: {
+       reason: `raw-binary ${architecture.data} entry_point ${entry.value.canonical} must be 4-byte aligned`,
+       constraint: "load_selection_rejected",
+     });
++  if (architecture.data === "m68k" && entry.value.value % 2n !== 0n)
++    return err({
++      reason: `raw-binary m68k entry_point ${entry.value.canonical} must be 2-byte aligned`,
++      constraint: "load_selection_rejected",
++    });
+   const length = validateRawBinaryLength(input.fileBytes);
+   if (!length.ok)
+     return err({
+diff --git a/src/ghidra/GhidraProvider.ts b/src/ghidra/GhidraProvider.ts
+index c48f589..8a745da 100644
+--- a/src/ghidra/GhidraProvider.ts
++++ b/src/ghidra/GhidraProvider.ts
+@@ -67,6 +67,7 @@ const SUPPORTED_ARCHITECTURES = new Set([
+   "arm64",
+   "mips",
+   "riscv",
++  "m68k",
+ ]);
+ 
+ /** Ghidra candidate backed by an isolated ephemeral headless import. */
+@@ -184,7 +185,7 @@ export class GhidraProvider implements AnalysisProviderCandidate {
+         status: "unsupported",
+         code: "architecture_unsupported",
+         reason:
+-          "Ghidra v1 requires a supported x86, x86_64, arm, arm64, or MIPS target profile.",
++          "Ghidra v1 requires a supported x86, x86_64, arm, arm64, MIPS, or raw-binary m68k target profile.",
+         diagnostics,
+       };
+     return {
+diff --git a/src/ghidra/GhidraProviderClient.ts b/src/ghidra/GhidraProviderClient.ts
+index 5a4f4ea..3fa8804 100644
+--- a/src/ghidra/GhidraProviderClient.ts
++++ b/src/ghidra/GhidraProviderClient.ts
+@@ -515,7 +515,7 @@ export const createGhidraProviderClient = (input: {
+     ...(target.format === "raw-binary"
+       ? [
+           "Headerless raw-binary analysis uses the caller-supplied architecture and entry address; file offset 0 is mapped at that address. Headers are not discovered from file bytes.",
+-          "Little-endian generic Ghidra languages are used for x86, x86_64, arm, and arm64. Big-endian, Thumb-only, Cortex-M, and other processor variants are unsupported in this increment.",
++          "Little-endian generic Ghidra languages are used for x86, x86_64, arm, and arm64; m68k uses the big-endian 68000 language. Other big-endian, Thumb-only, Cortex-M, and other processor variants are unsupported in this increment.",
+           "Static analysis does not emulate reset vectors, memory-mapped I/O, or firmware boot sequences.",
+         ]
+       : []),
+diff --git a/src/ghidra/GhidraRawBinaryLanguage.ts b/src/ghidra/GhidraRawBinaryLanguage.ts
+index ea024bd..51e5c20 100644
+--- a/src/ghidra/GhidraRawBinaryLanguage.ts
++++ b/src/ghidra/GhidraRawBinaryLanguage.ts
+@@ -1,4 +1,4 @@
+-import type { HeaderArchitecture } from "../domain/binaryTargetTypes.js";
++import type { RawBinaryArchitecture } from "../domain/binaryTargetTypes.js";
+ 
+ /** Bound Ghidra language for a caller-supplied raw-binary architecture. */
+ export interface GhidraRawBinaryLanguage {
+@@ -7,13 +7,14 @@ export interface GhidraRawBinaryLanguage {
+ }
+ 
+ /**
+- * Map the four caller-visible CPU families to little-endian generic Ghidra
+- * languages with a supported generic compiler specification. These are
+- * analysis conventions, not evidence of the target's original compiler.
+- * Big-endian, Thumb-only, and Cortex-M variants are out of scope.
++ * Map the caller-visible CPU families to generic Ghidra languages with a
++ * supported generic compiler specification. These are analysis conventions,
++ * not evidence of the target's original compiler. The x86 and ARM families
++ * are little-endian; m68k is the big-endian 68000 language. Thumb-only and
++ * Cortex-M variants are out of scope.
+  */
+ export const ghidraRawBinaryLanguage = (
+-  architecture: HeaderArchitecture,
++  architecture: RawBinaryArchitecture,
+ ): GhidraRawBinaryLanguage => {
+   switch (architecture) {
+     case "x86":
+@@ -24,5 +25,7 @@ export const ghidraRawBinaryLanguage = (
+       return { languageId: "ARM:LE:32:v7", compilerSpecId: "default" };
+     case "arm64":
+       return { languageId: "AARCH64:LE:64:v8A", compilerSpecId: "default" };
++    case "m68k":
++      return { languageId: "68000:BE:32:default", compilerSpecId: "default" };
+   }
+ };
+diff --git a/src/ghidra/GhidraRawBinaryLoadImage.test.ts b/src/ghidra/GhidraRawBinaryLoadImage.test.ts
+index 2fc1150..cc085cb 100644
+--- a/src/ghidra/GhidraRawBinaryLoadImage.test.ts
++++ b/src/ghidra/GhidraRawBinaryLoadImage.test.ts
+@@ -22,6 +22,10 @@ describe("raw-binary Ghidra language binding", () => {
+       languageId: "AARCH64:LE:64:v8A",
+       compilerSpecId: "default",
+     });
++    expect(ghidraRawBinaryLanguage("m68k")).toEqual({
++      languageId: "68000:BE:32:default",
++      compilerSpecId: "default",
++    });
+   });
+ });
+ 
+diff --git a/src/hopper/HopperAnalysisProfile.ts b/src/hopper/HopperAnalysisProfile.ts
+index 299862a..c74ca5e 100644
+--- a/src/hopper/HopperAnalysisProfile.ts
++++ b/src/hopper/HopperAnalysisProfile.ts
+@@ -12,6 +12,7 @@ import {
+   type BinaryTarget,
+   type ElfMetadataArchitecture,
+   type HeaderArchitecture,
++  type RawOnlyArchitecture,
+ } from "../domain/binaryTargetTypes.js";
+ import {
+   AnalysisCancelledError,
+@@ -105,11 +106,12 @@ export const resolveHopperAnalysisProfile = async (
+ 
+ /** Ghidra owns these lanes; Hopper names the family it declines rather than guessing. */
+ const HOPPER_DECLINED_ARCHITECTURE_LABELS: Record<
+-  ElfMetadataArchitecture,
++  ElfMetadataArchitecture | RawOnlyArchitecture,
+   string
+ > = {
+   mips: "MIPS",
+   riscv: "RISC-V",
++  m68k: "Motorola 68000",
+ };
+ 
+ /** Derive Hopper's complete non-interactive CLI loader selection. */
+@@ -124,7 +126,7 @@ export const hopperLoaderArgsForTarget = (
+   if (target.kind !== "executable")
+     return err(new ProviderAdapterError("hopper", "resolve_analysis_profile"));
+   const architecture = target.architecture;
+-  if (isElfMetadataArchitecture(architecture))
++  if (isElfMetadataArchitecture(architecture) || architecture === "m68k")
+     return err(
+       new AnalysisCapabilityUnavailableError(
+         "hopper",
+diff --git a/src/hopper/HopperMachOImage.ts b/src/hopper/HopperMachOImage.ts
+index 20a5310..92e9a06 100644
+--- a/src/hopper/HopperMachOImage.ts
++++ b/src/hopper/HopperMachOImage.ts
+@@ -129,7 +129,11 @@ export const resolveHopperMachOImage = async (
+       const identityError = validateFatSlice(slice, size, tableEnd, identity);
+       if (identityError !== null) return invalid(identityError);
+       ranges.push(slice);
+-      if (slice.cpuType === cpuTypes[target.architecture]) matches.push(slice);
++      if (
++        target.architecture !== "m68k" &&
++        slice.cpuType === cpuTypes[target.architecture]
++      )
++        matches.push(slice);
+     }
+     ranges.sort((a, b) => a.offset - b.offset);
+     for (let index = 1; index < ranges.length; index++) {
+-- 
+2.43.0
+
